@@ -100,8 +100,11 @@ _whisper_model = None
 if whisper:
     try:
         # Using "base.en" for a balance of speed and accuracy, like the example script
-        print("[speech‑to‑text] Loading local Whisper model (base.en)...", file=sys.stderr)
-        _whisper_model = whisper.load_model("base.en")
+        # model_version = "base.en"
+        model_version = "small.en"
+        # model_version = "medium.en"
+        print(f"[speech‑to‑text] Loading local Whisper model ({model_version})...", file=sys.stderr)
+        _whisper_model = whisper.load_model(model_version)
         print("[speech‑to‑text] Whisper model loaded.", file=sys.stderr)
     except Exception as exc:
         print(
@@ -114,8 +117,7 @@ if whisper:
 # ---------------------------------------------------------------------------
 # User‑tunable constants -----------------------------------------------------
 # ---------------------------------------------------------------------------
-HOTKEY = keyboard.Key.delete         # Hold this key to record
-HOTKEY = keyboard.Key.space         # Hold this key to record
+# HOTKEY = keyboard.Key.space         # Hold this key to record
 QUIT_KEY = keyboard.Key.esc      # Press this once to exit the program
 SAMPLE_RATE = 48_000             # Use device's default sample rate (48 kHz)
 CHANNELS = 1                     # Mono microphone
@@ -284,7 +286,7 @@ def main() -> None:  # noqa: D401
     print(
         textwrap.dedent(
             f"""
-            Press and hold {HOTKEY} to speak; release to insert text.
+            Press and hold Ctrl+Shift+K to speak; release to insert text.
             Press {QUIT_KEY} to quit.  (Backend = {'sounddevice' if _sounddevice_available else 'ffmpeg'})
             """.strip()
         )
@@ -298,16 +300,19 @@ def main() -> None:  # noqa: D401
 
     pressed = False
 
-    def on_press(key):  # noqa: D401
+    # State tracking for modifier keys
+    current_keys = set()
+
+    def start_recording():
         nonlocal pressed
-        if key == HOTKEY and not pressed:
+        if not pressed:
             pressed = True
             rec.start()
             print("🎙️  Recording… (release to transcribe)")
 
-    def on_release(key):  # noqa: D401
+    def stop_recording_and_transcribe():
         nonlocal pressed
-        if key == HOTKEY and pressed:
+        if pressed:
             pressed = False
             print("⏹️  Stopped. Transcribing…")
             audio = rec.stop()
@@ -325,10 +330,47 @@ def main() -> None:  # noqa: D401
             finally:
                 wav_path.unlink(missing_ok=True)
 
-        elif key == QUIT_KEY:
-            print("Exiting…")
-            return False  # stops pynput listener
+    # Combined press/release handler
+    def on_press(key):
+        nonlocal current_keys
 
+        # Check for Quit Key first
+        if key == QUIT_KEY:
+            print("Exiting…")
+            return False # Stop listener
+
+        # Track pressed keys for the hotkey combination
+        # Use canonical to handle left/right modifiers uniformly
+        canonical_key = listener.canonical(key)
+        current_keys.add(canonical_key)
+
+        # Define the required keys for the hotkey
+        required_keys = {keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char('k')}
+
+        # Activate if all required keys are currently pressed
+        if required_keys.issubset(current_keys):
+             start_recording()
+
+    def on_release(key):
+        nonlocal current_keys
+
+        # Use canonical to handle left/right modifiers uniformly
+        canonical_key = listener.canonical(key)
+
+        # Define the keys relevant for deactivation
+        deactivation_keys = {keyboard.Key.ctrl, keyboard.Key.shift, keyboard.KeyCode.from_char('k')}
+
+        # Deactivate if any of the hotkey components are released while recording
+        if pressed and canonical_key in deactivation_keys:
+            stop_recording_and_transcribe()
+
+        # Remove released key from the tracking set
+        try:
+            current_keys.remove(canonical_key)
+        except KeyError:
+            pass # Ignore if key wasn't in the set (e.g., due to race conditions)
+
+    # Setup the single listener
     with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
         listener.join()
 
