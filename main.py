@@ -3,7 +3,7 @@
 Speech‑to‑text hot‑key utility for Ubuntu / Linux
 ================================================
 
-Hold **F8** → speak → release **F8** → recognized words are typed into
+Hold **Left Shift** → speak → release **Left Shift** → recognized words are typed into
 whatever window currently has the keyboard focus.
 
 This revision removes the hard dependency on **PortAudio** (which broke on
@@ -24,7 +24,7 @@ Quick start
 -----------
 1.  **Dependencies** (Python 3.9+):
 
-        python3 -m pip install --user pynput numpy openai
+        python3 -m pip install --user pynput numpy openai-whisper
 
     *Optional* – for the native backend:
 
@@ -34,13 +34,13 @@ Quick start
 
 2.  Export your OpenAI API key so Whisper can be used::
 
-        export OPENAI_API_KEY="sk‑…"
+        # export OPENAI_API_KEY="sk‑…"  (No longer required for local Whisper)
 
 3.  Run the script (no sudo required)::
 
         python3 speech_to_text_hotkey.py
 
-4.  Press **F8**, speak, and release. Text is injected at the caret.
+4.  Press and hold **Left Shift**, speak, and release. Text is injected at the caret.
 
 Tests
 -----
@@ -65,6 +65,20 @@ from typing import List, Protocol, runtime_checkable
 import numpy as np
 from pynput import keyboard
 
+# <<< ADD WHISPER IMPORT >>>
+try:
+    import whisper
+except ImportError:
+    print(
+        "[speech‑to‑text] whisper unavailable, transcription via local model will fail.\n" \
+        "  Install it with: python3 -m pip install --user openai-whisper",
+        file=sys.stderr,
+    )
+    whisper = None
+# <<< END WHISPER IMPORT >>>
+
+# TODO How can we run this in background?
+
 # ---------------------------------------------------------------------------
 # Optional sounddevice import ------------------------------------------------
 # ---------------------------------------------------------------------------
@@ -81,12 +95,29 @@ except Exception as _exc:  # ImportError *or* PortAudio OSError
     _sd = None  # type: ignore[assignment]
     _sounddevice_available = False
 
+# <<< LOAD WHISPER MODEL >>>
+_whisper_model = None
+if whisper:
+    try:
+        # Using "base.en" for a balance of speed and accuracy, like the example script
+        print("[speech‑to‑text] Loading local Whisper model (base.en)...", file=sys.stderr)
+        _whisper_model = whisper.load_model("base.en")
+        print("[speech‑to‑text] Whisper model loaded.", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"[speech‑to‑text] Failed to load Whisper model: {exc}\n" \
+            "  Transcription will likely fail.",
+            file=sys.stderr,
+        )
+# <<< END LOAD WHISPER MODEL >>>
+
 # ---------------------------------------------------------------------------
 # User‑tunable constants -----------------------------------------------------
 # ---------------------------------------------------------------------------
-HOTKEY = keyboard.Key.f8         # Hold this key to record
+HOTKEY = keyboard.Key.delete         # Hold this key to record
+HOTKEY = keyboard.Key.space         # Hold this key to record
 QUIT_KEY = keyboard.Key.esc      # Press this once to exit the program
-SAMPLE_RATE = 16_000             # 16 kHz is plenty for speech recognition
+SAMPLE_RATE = 48_000             # Use device's default sample rate (48 kHz)
 CHANNELS = 1                     # Mono microphone
 TMP_DIR = Path(tempfile.gettempdir())
 
@@ -225,21 +256,16 @@ def _save_wav(signal: np.ndarray, samplerate: int) -> Path:
 # ---------------------------------------------------------------------------
 # Whisper transcription ------------------------------------------------------
 # ---------------------------------------------------------------------------
-try:
-    import openai  # noqa: WPS433 – runtime dependency
-except ImportError:
-    openai = None  # type: ignore[assignment]
-
 
 def transcribe(path: Path) -> str:
     """Return Whisper transcription of the WAV at *path* (blocking)."""
-    if openai is None:
-        raise RuntimeError("Package 'openai' not installed. 'pip install openai' or mock ≈ transcribe().")
-    if not (api_key := os.getenv("OPENAI_API_KEY")):
-        raise RuntimeError("Set the OPENAI_API_KEY environment variable.")
-    openai.api_key = api_key
-    with path.open("rb") as f:
-        return openai.Audio.transcribe(model="whisper-1", file=f, response_format="text").strip()
+    if _whisper_model is None:
+        raise RuntimeError(
+            "Whisper model not loaded. Install 'openai-whisper' or check loading errors."
+        )
+    # Transcribe using the globally loaded local model
+    result = _whisper_model.transcribe(str(path))
+    return result["text"].strip()
 
 
 # ---------------------------------------------------------------------------
