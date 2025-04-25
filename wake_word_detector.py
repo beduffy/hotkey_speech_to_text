@@ -4,6 +4,13 @@ import struct
 import subprocess as sp
 import shutil
 import numpy as np
+import threading
+import torch
+import torchaudio
+import silero_vad
+from pathlib import Path
+import tempfile
+import wave
 
 # --- Wake Word Detection Dependencies ---
 # This typically requires a dedicated library. Popular choices include:
@@ -26,12 +33,22 @@ try:
     import sounddevice as sd
 except ImportError as e:
     print(f"Error importing dependencies: {e}", file=sys.stderr, flush=True)
-    print("  Please install required packages: pip install pvporcupine sounddevice", file=sys.stderr, flush=True)
+    print("  Please install required packages: pip install pvporcupine sounddevice silero-vad torch torchaudio", file=sys.stderr, flush=True)
     # Optionally exit or disable wake word feature
     # sys.exit(1)
 
+# Whisper import (similar to main.py)
+try:
+    import whisper
+except ImportError:
+    whisper = None # Handled later
+
 
 class WakeWordDetector:
+    # Define states
+    STATE_WAITING = "WAITING_FOR_WAKE_WORD"
+    STATE_RECORDING = "RECORDING_COMMAND"
+
     def __init__(self, access_key=None, library_path=None, model_path=None, keyword_paths=None, sensitivities=None):
         """
         Initializes the wake word engine.
@@ -58,12 +75,24 @@ class WakeWordDetector:
         self._handle = None # Placeholder for engine instance
         self._audio_stream = None # For sounddevice stream
 
+        # VAD related variables
+        self._vad_model = None
+        self._vad_utils = None # For get_speech_timestamps etc.
+        self._current_state = self.STATE_WAITING
+        self._command_audio_buffer = [] # Store chunks of command audio
+        self._is_speaking = False
+
+        # Whisper model
+        self._whisper_model = None
+
         # Example parameters (adjust based on engine requirements)
         self.frame_length = None
         self.sample_rate = None
 
         try:
             self._setup_engine()
+            self._setup_vad()
+            self._setup_whisper()
             if self._handle:
                  self._setup_audio_stream()
             print("Wake Word Detector Initialized.", flush=True)
@@ -138,17 +167,30 @@ class WakeWordDetector:
             self._audio_stream = None
             raise # Re-raise the exception
 
-    def wait_for_wake_word(self):
+    def run(self):
         """
-        Listens continuously and returns the index of the detected keyword
-        once a wake word is detected. Returns None if stopped or error occurs.
+        Runs the main loop, listening for wake words and commands.
         """
         if not self._handle or not self._audio_stream:
             # Initialization should have handled this, but check just in case.
             print("Error: Wake word engine or audio stream not ready.", file=sys.stderr, flush=True)
             return None
 
-        print(f"Listening for wake word(s)...", flush=True)
+        # --- VAD Configuration --- 
+        # Silero VAD works best on 16kHz chunks, but can handle others.
+        # We need to feed it audio compatible with its requirements.
+        # Since we capture at 48kHz, we'll resample for VAD too.
+        vad_sample_rate = 16000 # Silero VAD preferred rate
+        vad_resample_factor = self.capture_sample_rate // vad_sample_rate
+        # VAD works on chunks; window size examples: 256, 512, 768, 1024, 1536 samples (at 16kHz)
+        # Let's use a similar frame size as Porcupine for consistency
+        vad_window_size = 512 # samples at vad_sample_rate
+        vad_window_size_capture = vad_window_size * vad_resample_factor
+        # Threshold for speech probability (adjust as needed)
+        vad_threshold = 0.5
+        # --- End VAD Config --- 
+
+        print(f"Starting main loop... State: {self._current_state}", flush=True)
         try:
             # Buffer to hold samples between reads, ensuring we have enough to process
             buffer = np.array([], dtype=np.int16)
@@ -156,43 +198,96 @@ class WakeWordDetector:
 
             while True:
                 # Read audio frames captured at the higher sample rate
-                pcm_capture, overflowed = self._audio_stream.read(self.capture_frame_length)
+                # Read a larger chunk to better accommodate VAD processing
+                read_length = self.capture_frame_length * 4 # Read a few porcupine frames worth
+                pcm_capture, overflowed = self._audio_stream.read(read_length)
 
                 if overflowed:
                     print("Warning: Audio buffer overflowed during capture.", file=sys.stderr, flush=True)
 
                 # Append new samples to the buffer
-                buffer = np.concatenate((buffer, pcm_capture.flatten()))
+                new_samples = pcm_capture.flatten()
+                buffer = np.concatenate((buffer, new_samples))
 
-                # Process frames as long as we have enough samples in the buffer
-                # We need enough samples at the capture rate to produce one frame at the target rate
-                process_frame_len_capture = self.frame_length * resample_factor
+                # --- State-Based Processing --- 
 
-                while len(buffer) >= process_frame_len_capture:
-                    # Extract samples needed for one Porcupine frame from the buffer
-                    frame_to_process_capture = buffer[:process_frame_len_capture]
-                    # Remove processed samples from the buffer
-                    buffer = buffer[process_frame_len_capture:]
+                if self._current_state == self.STATE_WAITING:
+                     # Process frames as long as we have enough samples in the buffer for Porcupine
+                     process_frame_len_capture = self.frame_length * resample_factor
+                     while len(buffer) >= process_frame_len_capture:
+                         frame_to_process_capture = buffer[:process_frame_len_capture]
+                         buffer = buffer[process_frame_len_capture:] # Consume from buffer
+                         pcm_resampled = frame_to_process_capture[::resample_factor]
+                         if len(pcm_resampled) != self.frame_length:
+                             print(f"Warning: Porcupine frame length mismatch. {len(pcm_resampled)} != {self.frame_length}", file=sys.stderr, flush=True)
+                             continue
+                         result = self._handle.process(pcm_resampled)
+                         if result >= 0:
+                             print(f"\nWake word detected! ({self._keyword_paths[result]})", flush=True)
+                             self._current_state = self.STATE_RECORDING
+                             self._command_audio_buffer = [] # Clear buffer for command
+                             self._is_speaking = False # Reset speaking flag
+                             # Optional: Play start sound
+                             print("Listening for command...", flush=True)
+                             break # Exit inner loop to handle VAD in outer loop
+                     # If buffer has less than a frame left, keep it for next read
 
-                    # Resample by taking every Nth sample
-                    pcm_resampled = frame_to_process_capture[::resample_factor]
+                elif self._current_state == self.STATE_RECORDING:
+                     # Need enough *new* samples in the buffer for VAD check
+                     # Let's process based on the new samples read in this iteration
+                     if len(new_samples) > 0 and self._vad_model:
+                         # Resample the *new* audio chunk for VAD
+                         vad_samples_resampled = new_samples[::vad_resample_factor]
+                         # Convert to torch tensor
+                         audio_tensor = torch.from_numpy(vad_samples_resampled).float()
+                         # Get speech probability
+                         speech_prob = self._vad_model(audio_tensor, vad_sample_rate).item()
 
-                    # Ensure the resampled frame has the correct length expected by Porcupine
-                    if len(pcm_resampled) != self.frame_length:
-                        print(f"Warning: Resampled frame length mismatch. Expected {self.frame_length}, got {len(pcm_resampled)}", file=sys.stderr, flush=True)
-                        continue # Skip this frame
+                         # --- Simple VAD Logic --- 
+                         if speech_prob > vad_threshold:
+                             print(".", end='' , flush=True) # Indicate speech detected
+                             self._is_speaking = True
+                             # Append the ORIGINAL 48kHz audio to the command buffer
+                             self._command_audio_buffer.append(new_samples)
+                         elif self._is_speaking:
+                             # Speech was happening, but now it stopped (silence)
+                             print("\nSilence detected, processing command.", flush=True)
+                             # Combine buffered command audio
+                             command_audio = np.concatenate(self._command_audio_buffer)
+                             self._command_audio_buffer = [] # Clear buffer
+                             self._is_speaking = False
 
-                    # Pass the resampled frame to Porcupine
-                    result = self._handle.process(pcm_resampled)
+                             # --- Process the Command Audio --- 
+                             if command_audio.size > 0:
+                                 # TODO: Integrate whisper transcription here
+                                 print(f"  Command audio recorded ({command_audio.size / self.capture_sample_rate:.2f}s). Transcribing...", flush=True)
+                                 # Example: save and transcribe
+                                 temp_wav_path = Path(tempfile.gettempdir()) / "temp_command.wav"
+                                 self.save_wav(temp_wav_path, command_audio, self.capture_sample_rate)
+                                 # Add transcription logic here (needs whisper model access)
+                                 if self._whisper_model:
+                                     try:
+                                         # Transcribe the 48kHz audio directly
+                                         result = self._whisper_model.transcribe(str(temp_wav_path))
+                                         text = result["text"].strip()
+                                         print(f"  Transcription: {text}", flush=True)
+                                         # TODO: Act on transcription (e.g., pass to GPT, run command)
+                                     except Exception as e:
+                                         print(f"  Transcription failed: {e}", file=sys.stderr, flush=True)
+                                 else:
+                                     print("  Whisper model not loaded, cannot transcribe.", file=sys.stderr, flush=True)
+                             else:
+                                 print("  No command audio captured after wake word.", flush=True)
 
-                    # Check if a keyword was detected
-                    if result >= 0:
-                        print(f"Detected keyword index: {result} ({self._keyword_paths[result]})", flush=True)
-                        return result # Return the index of the detected keyword
-
-            # If loop exits, stream became inactive without detection (shouldn't happen in while True)
-            print("Audio stream loop exited unexpectedly.", file=sys.stderr, flush=True)
-            return None
+                             # --- Switch back to waiting state --- 
+                             self._current_state = self.STATE_WAITING
+                             print(f"\nSwitching back to {self._current_state}...", flush=True)
+                             # Ensure buffer doesn't grow indefinitely if VAD misses silence
+                             buffer = np.array([], dtype=np.int16)
+                     # Ensure buffer doesn't grow indefinitely if only silence is detected
+                     if len(buffer) > self.capture_sample_rate * 10: # Keep max 10 secs in buffer
+                          print("Warning: Clearing excessive buffer during silence.", file=sys.stderr, flush=True)
+                          buffer = buffer[-self.capture_sample_rate * 5:] # Keep last 5 secs
 
         except KeyboardInterrupt:
             print("\nStopping wake word listener (KeyboardInterrupt).", flush=True)
@@ -224,6 +319,54 @@ class WakeWordDetector:
                  self._handle = None
 
         print("Wake Word Detector stopped.")
+
+    def _setup_vad(self):
+        """Loads the Silero VAD model."""
+        try:
+             # Load the VAD model
+             # Note: This downloads the model on first run
+             self._vad_model, self._vad_utils = silero_vad.load_silero_vad(force_reload=False)
+             print("Silero VAD model loaded.", flush=True)
+        except Exception as e:
+             print(f"Error loading Silero VAD model: {e}", file=sys.stderr, flush=True)
+             print("  Ensure torch and torchaudio are installed correctly.", file=sys.stderr, flush=True)
+             self._vad_model = None
+             # Decide if we should raise or just disable VAD
+             # raise
+
+    def _setup_whisper(self):
+        """Loads the Whisper model."""
+        if not whisper:
+            print("Error: openai-whisper library not imported. Cannot transcribe.", file=sys.stderr, flush=True)
+            print("  Install it with: pip install openai-whisper", file=sys.stderr, flush=True)
+            return
+
+        # Reuse model loading logic (consider making this configurable)
+        try:
+            model_version = "base.en" # Or small.en, medium.en, large
+            print(f"Loading local Whisper model ({model_version})...", file=sys.stderr, flush=True)
+            self._whisper_model = whisper.load_model(model_version)
+            print("Whisper model loaded.", flush=True)
+        except Exception as exc:
+            print(f"Failed to load Whisper model: {exc}", file=sys.stderr, flush=True)
+            self._whisper_model = None
+
+    # Helper to save WAV (similar to main.py, but takes path object)
+    def save_wav(self, path: Path, signal: np.ndarray, samplerate: int):
+        """Write *signal* to a WAV file at *path*."""
+        # Normalize to int16 range if it's float
+        if signal.dtype == np.float32 or signal.dtype == np.float64:
+            signal = np.clip(signal, -1.0, 1.0)
+            signal = (signal * 32767).astype(np.int16)
+        elif signal.dtype != np.int16:
+            raise ValueError("Signal must be int16 or float for WAV saving")
+
+        with wave.open(str(path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 2 bytes for int16
+            wf.setframerate(samplerate)
+            wf.writeframes(signal.tobytes())
+        print(f"Saved WAV to {path}", flush=True)
 
 
 # Example usage (for testing this file directly)
@@ -266,13 +409,8 @@ if __name__ == '__main__':
 
     try:
         # In a real application, you might call this in a loop or thread
-        detected_keyword_index = detector.wait_for_wake_word()
-
-        if detected_keyword_index is not None:
-             print(f"Wake word detected (index {detected_keyword_index})! Triggering action...", flush=True)
-             # TODO: Add logic here to start recording in main.py or trigger other actions
-        else:
-            print("Wake word listener finished without detection (or was stopped).", flush=True)
+        # The run method now handles the continuous loop
+        detector.run()
 
     finally:
         detector.stop() 
