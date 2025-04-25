@@ -100,9 +100,10 @@ _whisper_model = None
 if whisper:
     try:
         # Using "base.en" for a balance of speed and accuracy, like the example script
-        # model_version = "base.en"
-        model_version = "small.en"
+        model_version = "base.en"
+        # model_version = "small.en"
         # model_version = "medium.en"
+        model_version = "large"
         print(f"[speech‑to‑text] Loading local Whisper model ({model_version})...", file=sys.stderr)
         _whisper_model = whisper.load_model(model_version)
         print("[speech‑to‑text] Whisper model loaded.", file=sys.stderr)
@@ -158,6 +159,7 @@ class _SounddeviceRecorder:
         self._stream = _sd.InputStream(  # type: ignore[arg‑type]
             samplerate=self.samplerate,
             channels=self.channels,
+            device=1,
             dtype="float32",
             callback=self._callback,
         )
