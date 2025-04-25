@@ -8,6 +8,7 @@ import threading
 import torch
 import torchaudio
 import silero_vad
+import resampy
 from pathlib import Path
 import tempfile
 import wave
@@ -145,12 +146,18 @@ class WakeWordDetector:
 
         # We MUST capture at a rate the device supports (e.g., 48kHz)
         # and then resample down to self.sample_rate (16kHz) for Porcupine.
-        self.capture_sample_rate = 48000
-        # Calculate the frame length needed at the capture rate to get
-        # self.frame_length samples after downsampling by factor 3 (48k -> 16k)
-        self.capture_frame_length = self.frame_length * (self.capture_sample_rate // self.sample_rate)
+        # Try 44.1kHz as it's common and might reduce processing load vs 48kHz
+        self.capture_sample_rate = 44100 
+        if self.capture_sample_rate % self.sample_rate != 0:
+             # This simple resampling ([::N]) requires an integer factor
+             print(f"Warning: Capture rate {self.capture_sample_rate} is not an integer multiple of Porcupine rate {self.sample_rate}. Simple resampling may be inaccurate. Consider using 48000 or a dedicated library.", file=sys.stderr, flush=True)
+             # Fallback to 48k if 44.1k isn't a multiple
+             self.capture_sample_rate = 48000
+        
+        resample_factor = self.capture_sample_rate // self.sample_rate
+        self.capture_frame_length = self.frame_length * resample_factor
 
-        print(f"Attempting to capture at {self.capture_sample_rate} Hz (frame length {self.capture_frame_length}) for resampling...", flush=True)
+        print(f"Attempting to capture at {self.capture_sample_rate} Hz (resample factor {resample_factor}, frame length {self.capture_frame_length}) for resampling...", flush=True)
 
         try:
             self._audio_stream = sd.InputStream(
@@ -178,10 +185,9 @@ class WakeWordDetector:
 
         # --- VAD Configuration --- 
         # Silero VAD works best on 16kHz chunks, but can handle others.
-        # We need to feed it audio compatible with its requirements.
-        # Since we capture at 48kHz, we'll resample for VAD too.
+        # Since we capture at self.capture_sample_rate, we'll resample for VAD too.
         vad_sample_rate = 16000 # Silero VAD preferred rate
-        vad_resample_factor = self.capture_sample_rate // vad_sample_rate
+        vad_resample_factor = self.capture_sample_rate // vad_sample_rate # Must be integer
         # VAD works on chunks; window size examples: 256, 512, 768, 1024, 1536 samples (at 16kHz)
         # Let's use a similar frame size as Porcupine for consistency
         vad_window_size = 512 # samples at vad_sample_rate
@@ -194,7 +200,7 @@ class WakeWordDetector:
         try:
             # Buffer to hold samples between reads, ensuring we have enough to process
             buffer = np.array([], dtype=np.int16)
-            resample_factor = self.capture_sample_rate // self.sample_rate # Should be 3 (48k / 16k)
+            porcupine_resample_factor = self.capture_sample_rate // self.sample_rate
 
             while True:
                 # Read audio frames captured at the higher sample rate
@@ -213,11 +219,18 @@ class WakeWordDetector:
 
                 if self._current_state == self.STATE_WAITING:
                      # Process frames as long as we have enough samples in the buffer for Porcupine
-                     process_frame_len_capture = self.frame_length * resample_factor
+                     process_frame_len_capture = self.frame_length * porcupine_resample_factor
                      while len(buffer) >= process_frame_len_capture:
                          frame_to_process_capture = buffer[:process_frame_len_capture]
                          buffer = buffer[process_frame_len_capture:] # Consume from buffer
-                         pcm_resampled = frame_to_process_capture[::resample_factor]
+
+                         # Use resampy for higher quality and potentially better performance
+                         # Ensure input is float for resampy
+                         frame_float = frame_to_process_capture.astype(np.float32)
+                         pcm_resampled_float = resampy.resample(frame_float, self.capture_sample_rate, self.sample_rate, filter='kaiser_fast')
+                         # Convert back to int16 for Porcupine
+                         pcm_resampled = pcm_resampled_float.astype(np.int16)
+
                          if len(pcm_resampled) != self.frame_length:
                              print(f"Warning: Porcupine frame length mismatch. {len(pcm_resampled)} != {self.frame_length}", file=sys.stderr, flush=True)
                              continue
@@ -237,9 +250,11 @@ class WakeWordDetector:
                      # Let's process based on the new samples read in this iteration
                      if len(new_samples) > 0 and self._vad_model:
                          # Resample the *new* audio chunk for VAD
-                         vad_samples_resampled = new_samples[::vad_resample_factor]
-                         # Convert to torch tensor
-                         audio_tensor = torch.from_numpy(vad_samples_resampled).float()
+                         # Use resampy here too
+                         new_samples_float = new_samples.astype(np.float32)
+                         vad_samples_resampled_float = resampy.resample(new_samples_float, self.capture_sample_rate, vad_sample_rate, filter='kaiser_fast')
+                         # Convert to required format for VAD (tensor)
+                         audio_tensor = torch.from_numpy(vad_samples_resampled_float).float()
                          # Get speech probability
                          speech_prob = self._vad_model(audio_tensor, vad_sample_rate).item()
 
@@ -325,10 +340,11 @@ class WakeWordDetector:
         try:
              # Load the VAD model
              # Note: This downloads the model on first run
-             self._vad_model, self._vad_utils = silero_vad.load_silero_vad(force_reload=False)
+             self._vad_model, self._vad_utils = silero_vad.load_silero_vad()
              print("Silero VAD model loaded.", flush=True)
         except Exception as e:
-             print(f"Error loading Silero VAD model: {e}", file=sys.stderr, flush=True)
+             # Print the full exception for better debugging
+             print(f"Error loading Silero VAD model: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
              print("  Ensure torch and torchaudio are installed correctly.", file=sys.stderr, flush=True)
              self._vad_model = None
              # Decide if we should raise or just disable VAD
