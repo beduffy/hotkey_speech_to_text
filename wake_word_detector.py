@@ -4,7 +4,6 @@ import struct
 import subprocess as sp
 import shutil
 import numpy as np
-import threading
 
 # --- Wake Word Detection Dependencies ---
 # This typically requires a dedicated library. Popular choices include:
@@ -58,8 +57,6 @@ class WakeWordDetector:
 
         self._handle = None # Placeholder for engine instance
         self._audio_stream = None # For sounddevice stream
-        self._wake_word_detected_event = threading.Event() # Event to signal detection
-        self._detected_keyword_index = -1 # Store the index of the detected keyword
 
         # Example parameters (adjust based on engine requirements)
         self.frame_length = None
@@ -129,11 +126,10 @@ class WakeWordDetector:
         try:
             self._audio_stream = sd.InputStream(
                  samplerate=self.capture_sample_rate,
-                 blocksize=0, # Let sounddevice choose optimal blocksize for callback
+                 blocksize=self.capture_frame_length, # Read blocks suitable for resampling
                  device=1,                    # Use explicit device index
                  channels=1,
                  dtype='int16',
-                 callback=self._audio_callback # Register the callback function
                  )
             self._audio_stream.start()
             print("Audio stream opened successfully at capture rate.", flush=True)
@@ -141,44 +137,6 @@ class WakeWordDetector:
             print(f"Error opening audio stream at {self.capture_sample_rate} Hz: {e}", file=sys.stderr, flush=True)
             self._audio_stream = None
             raise # Re-raise the exception
-
-    def _audio_callback(self, indata, frames, time, status):
-        """Callback function for sounddevice stream.
-
-        Processes incoming audio blocks, resamples, and calls Porcupine.
-        Sets an event if the wake word is detected.
-        """
-        if status:
-            print(f"Audio stream error: {status}", file=sys.stderr, flush=True)
-            return
-
-        # Porcupine expects samples as a list/tuple of int16
-        pcm_capture = indata[:, 0] # Flatten to 1D if necessary
-
-        # Basic resampling: take every Nth sample
-        # Note: This simple method can introduce aliasing. For higher quality,
-        # consider using a dedicated resampling library like resampy or soxr-python.
-        resample_factor = self.capture_sample_rate // self.sample_rate # Should be 3
-        pcm_resampled = pcm_capture[::resample_factor]
-
-        # We might get blocks that don't align perfectly with Porcupine frame length.
-        # Process in chunks matching Porcupine's frame length.
-        # This simplistic approach assumes block size is a multiple, might need buffering
-        # if sounddevice gives variable block sizes.
-        idx = 0
-        while idx + self.frame_length <= len(pcm_resampled):
-            frame = pcm_resampled[idx : idx + self.frame_length]
-            idx += self.frame_length
-
-            try:
-                result = self._handle.process(frame)
-                if result >= 0:
-                    print(f"Detected keyword index: {result} ({self._keyword_paths[result]})", flush=True)
-                    self._detected_keyword_index = result
-                    self._wake_word_detected_event.set() # Signal detection
-                    # Don't return from callback, just signal
-            except Exception as e:
-                print(f"Error processing audio frame in callback: {e}", file=sys.stderr, flush=True)
 
     def wait_for_wake_word(self):
         """
@@ -190,19 +148,52 @@ class WakeWordDetector:
             print("Error: Wake word engine or audio stream not ready.", file=sys.stderr, flush=True)
             return None
 
-        # Ensure the stream is running (it should be if callback was set)
-        if self._audio_stream and not self._audio_stream.active:
-            print("Restarting audio stream...")
-            self._audio_stream.start()
-
         print(f"Listening for wake word(s)...", flush=True)
         try:
-            self._wake_word_detected_event.clear() # Reset event before waiting
-            self._detected_keyword_index = -1
-            # Wait indefinitely until the callback sets the event
-            self._wake_word_detected_event.wait()
-            # Once event is set, return the index stored by the callback
-            return self._detected_keyword_index
+            # Buffer to hold samples between reads, ensuring we have enough to process
+            buffer = np.array([], dtype=np.int16)
+            resample_factor = self.capture_sample_rate // self.sample_rate # Should be 3 (48k / 16k)
+
+            while True:
+                # Read audio frames captured at the higher sample rate
+                pcm_capture, overflowed = self._audio_stream.read(self.capture_frame_length)
+
+                if overflowed:
+                    print("Warning: Audio buffer overflowed during capture.", file=sys.stderr, flush=True)
+
+                # Append new samples to the buffer
+                buffer = np.concatenate((buffer, pcm_capture.flatten()))
+
+                # Process frames as long as we have enough samples in the buffer
+                # We need enough samples at the capture rate to produce one frame at the target rate
+                process_frame_len_capture = self.frame_length * resample_factor
+
+                while len(buffer) >= process_frame_len_capture:
+                    # Extract samples needed for one Porcupine frame from the buffer
+                    frame_to_process_capture = buffer[:process_frame_len_capture]
+                    # Remove processed samples from the buffer
+                    buffer = buffer[process_frame_len_capture:]
+
+                    # Resample by taking every Nth sample
+                    pcm_resampled = frame_to_process_capture[::resample_factor]
+
+                    # Ensure the resampled frame has the correct length expected by Porcupine
+                    if len(pcm_resampled) != self.frame_length:
+                        print(f"Warning: Resampled frame length mismatch. Expected {self.frame_length}, got {len(pcm_resampled)}", file=sys.stderr, flush=True)
+                        continue # Skip this frame
+
+                    # Pass the resampled frame to Porcupine
+                    result = self._handle.process(pcm_resampled)
+
+                    # Check if a keyword was detected
+                    if result >= 0:
+                        print(f"Detected keyword index: {result} ({self._keyword_paths[result]})", flush=True)
+                        return result # Return the index of the detected keyword
+
+            # If loop exits, stream became inactive without detection (shouldn't happen in while True)
+            print("Audio stream loop exited unexpectedly.", file=sys.stderr, flush=True)
+            return None
+
         except KeyboardInterrupt:
             print("\nStopping wake word listener (KeyboardInterrupt).", flush=True)
             return None
